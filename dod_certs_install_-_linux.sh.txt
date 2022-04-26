@@ -1,0 +1,154 @@
+#!/bin/bash
+
+#####################################################
+#
+# Import DoD root certificates into linux CA store
+#
+# TODO: 
+#
+# 1) Verify that DoD Root 3 is the only certificate present in the DoD_PKE_PEM.pem file using the following command:
+#
+#   openssl crl2pkcs7 -nocrl -certfile DoD_PKE_PEM.pem  | openssl pkcs7 -print_certs -noout
+#
+# Verify the following output and confirm that there are no additional certificates listed:
+#
+# subject=/C=US/O=U.S. Government/OU=DoD/OU=PKI/CN=DoD Root CA 3
+# issuer=/C=US/O=U.S. Government/OU=DoD/OU=PKI/CN=DoD Root CA 3
+#
+#
+# 2)  Determine the Thumbprint on DoD Root CA 3 (the first DoD_PKE_PEM.pem certificate) using the following command:
+#
+#     openssl x509 -in DoD_PKE_PEM.pem -subject -issuer -fingerprint -noout
+#
+# Verify the following output:
+# subject= /C=US/O=U.S. Government/OU=DoD/OU=PKI/CN=DoD Root CA 3
+# issuer= /C=US/O=U.S. Government/OU=DoD/OU=PKI/CN=DoD Root CA 3
+# SHA1 Fingerprint=D7:3C:A9:11:02:A2:20:4A:36:45:9E:D3:22:13:B4:67:D7:CE:97:FB
+#
+# 3) Verify the DoD Root CA 3 SHA1 Fingerprint against the value posted at https://crl.disa.mil:
+#
+# - Select DOD ROOT CA 3 from the list of CAs (listed alphabetically) and click "Submit Selection"
+# - Click "View" to view the certificate
+# - Scroll to the bottom of the certificate page and verify that the listed SHA-1 Certificate Fingerprint matches the value
+# output in step 1 above.
+#
+#
+# 4) Verify the S/MIME signature on Certificates_PKCS7_v5.9_DoD.sha256 using the following command:
+#
+#   openssl smime -verify -in Certificates_PKCS7_v5.9_DoD.sha256 -inform DER -CAfile DoD_PKE_PEM.pem \
+#       | dos2unix | sha256sum -c
+#
+#   Verify the following output:
+#   Verification successful
+#
+#   Then for each file listed in the output of the openssl smime -verify command, generate a local hash:
+#   > certutil -hashfile FILENAME sha256
+#
+#   Verify that the output matches the hash listed for the file in the Certificates_PKCS7_v5.9_DoD.sha256 openssl smime
+#   -verify output.
+#
+#
+#####################################################
+
+
+ 
+main() {
+    # Location of bundle from DISA site
+    url='https://public.cyber.mil/pki-pke/pkipke-document-library/'
+    bundle=$(curl -s $url | awk -F '"' 'tolower($3) ~ /dod\.zip/ {print $2}')
+    #bundle=https://dl.dod.cyber.mil/wp-content/uploads/pki-pke/zip/certificates_pkcs7_v5-6_dod.zip
+
+    # Set cert directory and update command based on OS
+    source /etc/os-release
+    if [[ $ID      =~ (fedora|rhel|centos) ||
+          $ID_LIKE =~ (fedora|rhel|centos) ]]; then
+        certdir=/etc/pki/ca-trust/source/anchors
+        update=update-ca-trust
+    elif [[ $ID      =~ (debian|ubuntu|mint) ||
+            $ID_LIKE =~ (debian|ubuntu|mint) ]]; then
+        certdir=/usr/local/share/ca-certificates
+        update=update-ca-certificates
+    else
+        certdir=$1
+        update=$2
+    fi
+
+    [[ -n $certdir && -n $update ]] || {
+        echo 'Unable to autodetect OS using /etc/os-release.'
+        echo 'Please provide CA certificate directory and update command.'
+        echo 'Example: add-dod-certs.sh /cert/store/location update-cmd'
+        exit 1
+    }
+
+    # Verify if CA TRUST is EMPTY if not BACKUP
+    if [ -d /etc/pki/ca-trust/source/anchors/ ] && [ -n "$(ls -A /etc/pki/ca-trust/source/anchors/)" ]; 
+    then
+        echo "NOT-EMPTY"; find /etc/pki/ca-trust/source/anchors/ -type f -iregex '.*\.p7b$' -exec echo {} {}.BACKUP-`date +%s` \;; 
+    else 
+        echo "EMPTY"; 
+    fi
+
+    # Download and extract the bundle
+    cd $certdir
+    wget -qP tmp $bundle
+    unzip -qj tmp/${bundle##*/} -d tmp
+
+    # Convert the PKCS#7 bundle into individual PEM files
+    openssl pkcs7 -print_certs -in tmp/*.pem.p7b |
+        awk 'BEGIN {c=0} /subject=/ {c++} {print > "cert." c ".pem"}'
+
+    # Rename the files based on the CA name
+    for i in *.pem; do
+        name=$(openssl x509 -noout -subject -in $i |
+               awk -F '(=|= )' '{gsub(/ /, "_", $NF); print $NF}'
+        )
+        mv $i ${name}.crt
+    done
+
+    # update CA TRUST store
+    $update
+
+    # validate the certs downloaded are installed 
+    crt_list=();
+    trust_list=();
+    intersection=();
+
+    for i in *.crt; 
+    do 
+        crt_list+=(`echo ${i%%.*}|sed 's/_/ /g'`);
+    done
+
+    trust_list=(`trust list | awk -F: 'tolower($2) ~ /dod/{print $2}'`)
+
+    # check length of crt and trust arrays; proceed with validation if true
+    if [[ "${#crt_list[@]}" == "${#trust_list[@]}" ]];
+    then
+        echo "run second part; compare arrays as intersection"
+        for ((x=0; x<=${crt_list[@]}; x++));
+        do
+            for y in "${trust_list[@]}";
+            do
+                # if there's a delta, append it to the intersection array
+                if [[ "${crt_list[$x]}" == "$y" ]];
+                then
+                    intersection+="$y"
+                fi
+                break
+            done
+        done
+        if [[ -z "${intersection[@]}" ]]
+        then
+            echo "PASSED: CERTS MATCH"
+        else
+            echo "FAILED: CERTS DO NOT MATCH; UNINSTALL"
+        fi
+    else
+        echo "abort; uninstall"
+    fi
+
+    # Remove temp files
+    rm -fr tmp
+}
+
+# Only execute if not being sourced
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
